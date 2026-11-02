@@ -21,6 +21,9 @@ Discretization:
     - Poisson is solved "for free" by one division by -k^2.
 
 The scalar Laplacian  -K2*u_hat  generalizes to a matrix operator  M(k) . P_hat .
+
+Defaults are chosen so that a proper tetragonal ferroelectric with multiple
+degenerate axial variants forms 90 deg / 180 deg domain patterns.
 """
 
 import streamlit as st
@@ -61,7 +64,7 @@ st.sidebar.header("Grid")
 max_res = 1024 if GPU_AVAILABLE else 512
 Nx = st.sidebar.slider("Nx", 64, max_res, 256, 32)
 Ny = st.sidebar.slider("Ny", 64, max_res, 256, 32)
-L_box = st.sidebar.number_input("Box size L (nd)", 0.5, 10.0, 1.0, 0.1)
+L_box = st.sidebar.number_input("Box size L (nd)", 1.0, 20.0, 8.0, 0.5)
 
 st.sidebar.header("Time stepping")
 dt = st.sidebar.number_input("dt (nd)", 1e-4, 1e-1, 1e-2, format="%.4f")
@@ -71,11 +74,12 @@ save_every = st.sidebar.slider("Save every", 1, 200, max(1, 2000 // 30), 1)
 st.sidebar.header("Landau–Devonshire (bulk)")
 alpha1  = st.sidebar.number_input("α₁  (<0 below Tc)", -5.0, 0.0, -1.0, 0.1)
 alpha11 = st.sidebar.number_input("α₁₁ (>0)", 0.01, 10.0, 1.0, 0.05)
-alpha12 = st.sidebar.number_input("α₁₂", -5.0, 5.0, 1.0, 0.1)
+st.sidebar.markdown("*For proper tetragonal symmetry, need α₁₂ > 2α₁₁*")
+alpha12 = st.sidebar.number_input("α₁₂ (must be > 2α₁₁ for tetragonal)", -2.0, 10.0, 2.5, 0.1)
 alpha111= st.sidebar.number_input("α₁₁₁ (6th-order, optional)", 0.0, 5.0, 0.0, 0.1)
 
 st.sidebar.header("Lifshitz gradient coefficients")
-G11 = st.sidebar.slider("G₁₁", 0.01, 5.0, 1.0, 0.01)
+G11 = st.sidebar.slider("G₁₁", 0.01, 5.0, 0.5, 0.01)
 G12 = st.sidebar.slider("G₁₂", -2.0, 2.0, 0.0, 0.01)
 G44 = st.sidebar.slider("G₄₄", 0.01, 5.0, 0.5, 0.01)
 
@@ -92,8 +96,33 @@ else:
     Ex_ext = Ey_ext = 0.0
 
 st.sidebar.header("Initial condition")
-noise_amp = st.sidebar.slider("Noise amplitude", 1e-4, 1e-1, 1e-2, format="%.4f")
+init_mode = st.sidebar.selectbox(
+    "Init type",
+    ["Band-limited noise (structured)", "Pure white noise", "Seeded stripes"],
+    index=0
+)
+noise_amp = st.sidebar.slider("Noise amplitude (≈ |Ps|)", 1e-3, 2.0, 0.5, 0.01)
+noise_cutoff = st.sidebar.slider("Band cutoff (frac of Nyquist)", 0.05, 0.5, 0.15, 0.01)
 seed = st.sidebar.number_input("Random seed", 0, 1000, 42)
+
+st.sidebar.header("Defect pinning (breaks uniform-P degeneracy)")
+use_pinning = st.sidebar.checkbox(
+    "Add spatial α₁ modulation (pins domains)", True
+)
+if use_pinning:
+    pinning_amp = st.sidebar.slider(
+        "Pinning strength δ (frac of |α₁|)", 0.0, 2.0, 0.5, 0.05
+    )
+    pinning_cutoff = st.sidebar.slider(
+        "Pinning length scale (frac of Nyquist)", 0.02, 0.3, 0.05, 0.01
+    )
+else:
+    pinning_amp = 0.0
+    pinning_cutoff = 0.0
+
+st.sidebar.header("Vector display")
+show_arrows = st.sidebar.checkbox("Overlay P arrows (quiver)", True)
+arrow_skip = st.sidebar.slider("Arrow subsample stride", 4, 40, 16, 2)
 
 run_button = st.sidebar.button("Run simulation")
 
@@ -103,6 +132,73 @@ def to_cpu(arr):
 
 def to_gpu(arr):
     return cp.asarray(arr) if GPU_AVAILABLE else arr
+
+# ------------------- INITIAL CONDITION -------------------
+def make_initial_P(Nx, Ny, L, mode, amp, cutoff, ps_eq):
+    """Generate structured initial polarization field.
+
+    Band-limited noise: smooth random field with amplitude ~ |Ps|,
+    low-pass filtered so domain-sized structure exists from t=0.
+    This is what produces multi-domain evolution like the reference results.
+    """
+    cp.random.seed(seed)
+    if mode == "Pure white noise":
+        Px = amp * (cp.random.rand(Nx, Ny) - 0.5)
+        Py = amp * (cp.random.rand(Nx, Ny) - 0.5)
+        return Px, Py
+
+    if mode == "Seeded stripes":
+        # 180-degree stripe seed along x with period L/4
+        x = cp.linspace(0, L, Nx, endpoint=False)[:, None]
+        y = cp.linspace(0, L, Ny, endpoint=False)[None, :]
+        stripes = cp.sign(cp.cos(2 * cp.pi * x * 4 / L))
+        Px = ps_eq * stripes * cp.ones_like(y)
+        Py = 0.05 * ps_eq * (cp.random.rand(Nx, Ny) - 0.5)
+        return Px, Py
+
+    # Band-limited noise (default): low-pass-filtered white noise
+    Px_raw = (cp.random.rand(Nx, Ny) - 0.5)
+    Py_raw = (cp.random.rand(Nx, Ny) - 0.5)
+    kx = cp.fft.fftfreq(Nx)  # in cycles per cell
+    ky = cp.fft.fftfreq(Ny)
+    KX, KY = cp.meshgrid(kx, ky, indexing='ij')
+    kr = cp.sqrt(KX**2 + KY**2)
+    mask = (kr <= cutoff).astype(cp.float64)
+    # Smooth mask edge to avoid ringing
+    mask = mask * cp.exp(-kr**2 / (2 * (cutoff * 1.2)**2))
+    Px_bl = cp.fft.ifft2(mask * cp.fft.fft2(Px_raw)).real
+    Py_bl = cp.fft.ifft2(mask * cp.fft.fft2(Py_raw)).real
+    # Normalize to desired amplitude
+    for f in (Px_bl, Py_bl):
+        f /= (cp.std(f) + 1e-12)
+    Px = amp * ps_eq * Px_bl
+    Py = amp * ps_eq * Py_bl
+    return Px, Py
+
+# ------------------- SPATIAL α₁ MODULATION (DEFECT PINNING) -------------------
+def build_alpha1_field(Nx, Ny, L, base_alpha1, delta, cutoff):
+    """Generate a smooth random spatial modulation of alpha_1.
+
+    alpha_1(r) = base_alpha1 * (1 + delta * eta(r))
+    where eta(r) is band-limited Gaussian noise with zero mean, unit std.
+    Regions where alpha_1 is more negative prefer larger |P|; regions where
+    it is less negative (or positive) prefer P = 0. This breaks the
+    degeneracy between uniform-P and multi-domain states and pins domain
+    walls at the defect sites -- the standard trick to stabilize
+    multi-domain patterns in 2D FFT phase-field simulations.
+    """
+    if delta <= 0:
+        return cp.full((Nx, Ny), base_alpha1, dtype=cp.float64)
+    cp.random.seed(seed + 1)
+    eta_raw = cp.random.randn(Nx, Ny)
+    kx = cp.fft.fftfreq(Nx)
+    ky = cp.fft.fftfreq(Ny)
+    KX, KY = cp.meshgrid(kx, ky, indexing='ij')
+    kr = cp.sqrt(KX**2 + KY**2)
+    mask = cp.exp(-kr**2 / (2 * cutoff**2))
+    eta_bl = cp.fft.ifft2(mask * cp.fft.fft2(eta_raw)).real
+    eta_bl /= (cp.std(eta_bl) + 1e-12)
+    return base_alpha1 * (1.0 + delta * eta_bl)
 
 # ------------------- K-SPACE OPERATORS -------------------
 def build_k_operators(Nx, Ny, L):
@@ -161,16 +257,17 @@ def solve_poisson(Px, Py, KX, KY, K2_safe):
     return Ex, Ey
 
 # ------------------- LANDAU-DERIVONSHIRE BULK -------------------
-def landau_deriv(Px, Py):
-    """d f_bulk / d P  for tetragonal Landau-Devonshire:
-        f_bulk = a1(P^2) + a11(Px^4+Py^4) + a12 Px^2 Py^2 + a111(Px^6+Py^6) + ...
-    Returns (dF/dPx, dF/dPy) — the NONLINEAR part, computed in real space.
+def landau_deriv(Px, Py, a1_field):
+    """d f_bulk / d P  for tetragonal Landau-Devonshire with spatially
+    varying alpha_1(r):
+        f_bulk = a1(r)*(P^2) + a11*(Px^4+Py^4) + a12*Px^2*Py^2 + a111*(Px^6+Py^6) + ...
+    Returns (dF/dPx, dF/dPy) -- the NONLINEAR part, computed in real space.
     """
-    dPx = (2*alpha1*Px
+    dPx = (2*a1_field*Px
            + 4*alpha11*Px**3
            + 2*alpha12*Px*Py**2
            + 6*alpha111*Px**5)
-    dPy = (2*alpha1*Py
+    dPy = (2*a1_field*Py
            + 4*alpha11*Py**3
            + 2*alpha12*Py*Px**2
            + 6*alpha111*Py**5)
@@ -181,32 +278,35 @@ def run_simulation():
     cp.random.seed(seed)
     KX, KY, K2_safe, M_xx, M_yy, M_xy, dx, dy = build_k_operators(Nx, Ny, L_box)
 
-    # Initial condition: small random noise around P = 0 (paraelectric state)
-    Px = noise_amp * (cp.random.rand(Nx, Ny) - 0.5)
-    Py = noise_amp * (cp.random.rand(Nx, Ny) - 0.5)
+    # Equilibrium spontaneous polarization magnitude (axial minimum)
+    Ps_eq = cp.sqrt(-alpha1 / (2*alpha11)) if alpha1 < 0 and alpha11 > 0 else 1.0
+    ps_eq_float = float(to_cpu(Ps_eq))
+
+    # Spatially varying alpha_1 field (defect pinning) -- KEY for stable
+    # multi-domain patterns in 2D FFT periodic simulations.
+    a1_field = build_alpha1_field(Nx, Ny, L_box, alpha1, pinning_amp, pinning_cutoff)
+
+    # Structured initial condition -- KEY for multi-domain evolution
+    Px, Py = make_initial_P(Nx, Ny, L_box, init_mode, noise_amp, noise_cutoff, Ps_eq)
 
     snapshots, energy_log = [], []
-    Ps_eq = cp.sqrt(-alpha1 / (2*alpha11)) if alpha1 < 0 and alpha11 > 0 else 1.0
 
     for step in range(n_steps + 1):
         # --- Nonlinear part of dF/dP (Landau bulk), computed in real space ---
-        dF_bulk_x, dF_bulk_y = landau_deriv(Px, Py)
+        dF_bulk_x, dF_bulk_y = landau_deriv(Px, Py, a1_field)
 
-        # --- Electrostatic field from Poisson (linear but treated as part of NL driving) ---
+        # --- Electrostatic field from Poisson ---
         if use_elec:
             Ex_dep, Ey_dep = solve_poisson(Px, Py, KX, KY, K2_safe)
-            # dF_elec/dP = -E_dep  (depolarization field opposes P divergence)
             dF_elec_x = -Ex_dep
             dF_elec_y = -Ey_dep
         else:
             dF_elec_x = dF_elec_y = 0.0
 
-        # External field contribution to dF/dP is -E_ext (constant in space)
         NL_x = dF_bulk_x + dF_elec_x - Ex_ext
         NL_y = dF_bulk_y + dF_elec_y - Ey_ext
 
         # --- Semi-implicit Fourier spectral step ---
-        #   [I + dt*Gamma*M] P^{n+1}_hat = P^n_hat - dt*Gamma*NL_hat
         Px_hat = cp.fft.fft2(Px)
         Py_hat = cp.fft.fft2(Py)
         NLx_hat = cp.fft.fft2(NL_x)
@@ -228,7 +328,7 @@ def run_simulation():
 
         # --- Diagnostics: energy components ---
         if step % save_every == 0 or step == n_steps:
-            f_bulk = (alpha1*(Px**2 + Py**2)
+            f_bulk = (a1_field*(Px**2 + Py**2)
                       + alpha11*(Px**4 + Py**4)
                       + alpha12*Px**2*Py**2
                       + alpha111*(Px**6 + Py**6))
@@ -241,14 +341,15 @@ def run_simulation():
                 Ex_dep, Ey_dep = solve_poisson(Px, Py, KX, KY, K2_safe)
                 f_elec = -0.5 * (Ex_dep*Px + Ey_dep*Py)
             else:
-                f_elec = 0.0
+                f_elec = cp.zeros_like(Px)
             total = float(cp.mean(f_bulk + f_grad + f_elec))
             energy_log.append((step, float(cp.mean(f_bulk)),
-                               float(cp.mean(f_grad)), float(cp.mean(f_elec) if use_elec else 0.0),
+                               float(cp.mean(f_grad)),
+                               float(cp.mean(f_elec)) if use_elec else 0.0,
                                total))
             snapshots.append((step, to_cpu(Px), to_cpu(Py)))
 
-    return snapshots, energy_log, Ps_eq
+    return snapshots, energy_log, ps_eq_float
 
 # ------------------- DOMAIN COLOR VISUALIZATION -------------------
 def polarization_color(Px, Py, Ps):
@@ -260,16 +361,41 @@ def polarization_color(Px, Py, Ps):
     hsv = np.stack([hue, np.ones_like(hue)*0.9, sat], axis=-1)
     return hsv_to_rgb(hsv)
 
-# ------------------- RUN + VISUALIZE -------------------
+# ------------------- VECTOR ARROW OVERLAY -------------------
+def overlay_quiver(ax, Px, Py, L, skip):
+    """Overlay white P-vector arrows on the current axes."""
+    Nx_, Ny_ = Px.shape
+    x = np.linspace(0, L, Nx_)
+    y = np.linspace(0, L, Ny_)
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    Xs = X[::skip, ::skip]
+    Ys = Y[::skip, ::skip]
+    Pxs = Px[::skip, ::skip]
+    Pys = Py[::skip, ::skip]
+    ax.quiver(Xs, Ys, Pxs, Pys,
+              color='white', scale=30, width=0.003,
+              headwidth=4, headlength=5, pivot='middle')
+
+# ------------------- RUN: store in session_state -------------------
 if run_button:
     with st.spinner(f"Running FFT phase-field on {'GPU' if GPU_AVAILABLE else 'CPU'}..."):
-        snaps, energy_log, Ps_eq = run_simulation()
-    st.success(f"Done. {len(snaps)} frames saved. Equilibrium |Ps| ≈ {float(to_cpu(Ps_eq)):.3f}")
+        snaps, energy_log, ps_eq_float = run_simulation()
+    st.session_state["snaps"] = snaps
+    st.session_state["energy_log"] = energy_log
+    st.session_state["ps_eq"] = ps_eq_float
+    st.session_state["frame_default"] = len(snaps) - 1
+    st.success(f"Done. {len(snaps)} frames saved. Equilibrium |Ps| ≈ {ps_eq_float:.3f}")
+
+# ------------------- VISUALIZATION (outside run_button so slider works) -------------------
+if "snaps" in st.session_state and st.session_state["snaps"]:
+    snaps = st.session_state["snaps"]
+    energy_log = st.session_state["energy_log"]
+    ps_eq = st.session_state["ps_eq"]
 
     # ----- Final snapshot -----
     st.header("Final polarization field")
     step_f, Px_f, Py_f = snaps[-1]
-    rgb = polarization_color(Px_f, Py_f, float(to_cpu(Ps_eq)))
+    rgb = polarization_color(Px_f, Py_f, ps_eq)
 
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
@@ -277,6 +403,8 @@ if run_button:
         ax.imshow(rgb, origin='lower', extent=[0, L_box, 0, L_box])
         ax.set_title(f"P @ step {step_f}   (color = direction, brightness = |P|)")
         ax.set_xlabel("x"); ax.set_ylabel("y")
+        if show_arrows:
+            overlay_quiver(ax, Px_f, Py_f, L_box, arrow_skip)
         # Color wheel
         ax_in = fig.add_axes([0.78, 0.78, 0.12, 0.12], polar=True)
         theta = np.linspace(0, 2*np.pi, 100)
@@ -289,16 +417,20 @@ if run_button:
     with col2:
         fig, ax = plt.subplots(figsize=(4.5, 4))
         im = ax.imshow(Px_f, origin='lower', cmap='RdBu_r',
-                       vmin=-float(to_cpu(Ps_eq)), vmax=float(to_cpu(Ps_eq)))
+                       vmin=-ps_eq, vmax=ps_eq)
         plt.colorbar(im, ax=ax, label="Pₓ")
         ax.set_title(f"Pₓ @ step {step_f}")
+        if show_arrows:
+            overlay_quiver(ax, Px_f, Py_f, L_box, arrow_skip)
         st.pyplot(fig)
     with col3:
         fig, ax = plt.subplots(figsize=(4.5, 4))
         im = ax.imshow(Py_f, origin='lower', cmap='RdBu_r',
-                       vmin=-float(to_cpu(Ps_eq)), vmax=float(to_cpu(Ps_eq)))
+                       vmin=-ps_eq, vmax=ps_eq)
         plt.colorbar(im, ax=ax, label="Pᵧ")
         ax.set_title(f"Pᵧ @ step {step_f}")
+        if show_arrows:
+            overlay_quiver(ax, Px_f, Py_f, L_box, arrow_skip)
         st.pyplot(fig)
 
     # ----- Energy evolution -----
@@ -316,14 +448,16 @@ if run_button:
     ax.legend(loc="best"); ax.grid(True, alpha=0.3)
     st.pyplot(fig)
 
-    # ----- Frame scrubber -----
+    # ----- Frame scrubber (persists across slider moves) -----
     st.header("Time evolution playback")
-    frame = st.slider("Frame", 0, len(snaps) - 1, len(snaps) - 1)
+    frame = st.slider("Frame", 0, len(snaps) - 1, len(snaps) - 1, key="frame_slider")
     s_i, Px_i, Py_i = snaps[frame]
-    rgb_i = polarization_color(Px_i, Py_i, float(to_cpu(Ps_eq)))
+    rgb_i = polarization_color(Px_i, Py_i, ps_eq)
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.imshow(rgb_i, origin='lower', extent=[0, L_box, 0, L_box])
     ax.set_title(f"P @ step {s_i}")
+    if show_arrows:
+        overlay_quiver(ax, Px_i, Py_i, L_box, arrow_skip)
     st.pyplot(fig)
 
     # ----- CSV export -----
@@ -339,19 +473,22 @@ else:
 # ------------------- NOTES -------------------
 st.markdown("""
 ---
-**Notes & extensions**
+**Notes**
 
-* **Periodic BCs only** — FFT mandates periodicity. For arbitrary geometries
-  (nanoparticles, curved surfaces) a finite-element discretization is more appropriate.
-* **Elastic + electrostrictive coupling** — omitted above for clarity. In a full
-  ferroelectric simulation you add:
-    f_elastic = 0.5 * C_ijkl * (eps_ij - eps^0_ij(P))(eps_kl - eps^0_kl(P))
-  where `eps^0_ij(P) = Q_ijkl * P_k * P_l` is the electrostrictive eigenstrain.
-  This adds a *P²-derivative* term to NL(P), computed in real space. The
-  mechanical equilibrium `div sigma = 0` can also be solved in Fourier for the
-  homogeneous-elasticity case.
-* **Why semi-implicit?** — Explicit Euler for `dP/dt = Gamma * G11 * nabla^2 P`
-  has stability limit `dt < dx^2 / (4 * Gamma * G11)`. The semi-implicit scheme
-  `(I + dt*Gamma*M) P^{n+1} = P^n + ...` is unconditionally stable for the
-  linear part, allowing dt ~100–1000x larger.
+* **Why α₁₂ > 2α₁₁?** For tetragonal ferroelectrics with four degenerate axial
+  variants (±P along x and y), the cross-coupling must satisfy α₁₂ > 2α₁₁.
+  Otherwise the diagonal state (Pₓ = Pᵧ) is energetically lower and only one
+  effective polarization direction survives -- the system collapses to a
+  uniform single domain.
+* **Why band-limited noise?** Pure white noise at tiny amplitude gets damped
+  to zero within a few steps and the system flows to the nearest uniform
+  minimum. Band-limited noise (low-pass filtered) seeds domain-sized spatial
+  structure, which then evolves into 90°/180° walls.
+* **Box size matters.** Domain-wall width ξ ~ √(G₁₁/|α₁|). The box must hold
+  many wall widths for multi-domain patterns to form.
+* **Periodic BCs only** -- FFT mandates periodicity. For arbitrary geometries
+  a finite-element discretization is more appropriate.
+* **Why semi-implicit?** Explicit Euler for `dP/dt = Γ·G₁₁·∇²P` has stability
+  limit `dt < dx²/(4·Γ·G₁₁)`. The semi-implicit scheme is unconditionally
+  stable for the linear part.
 """)
