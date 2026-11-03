@@ -1985,7 +1985,7 @@ def make_initial_P(Nx, Ny, L, mode, amp, cutoff, ps_eq, seed, xp):
 # ============================================================================
 # LANDAU-DEVONSHIRE BULK DERIVATIVE (3-COMPONENT)
 # ============================================================================
-def landau_deriv_3c(Px, Py, Pz, mat):
+def landau_deriv_3c(Px, Py, Pz, mat, xp=None):
     """d f_bulk / dP for 3-component tetragonal Landau-Devonshire + substrate.
 
     f_bulk = alpha1*(Px² + Py² + Pz²)
@@ -1996,7 +1996,21 @@ def landau_deriv_3c(Px, Py, Pz, mat):
     Returns (dF/dPx, dF/dPy, dF/dPz) — the NONLINEAR part, computed in real space.
     The substrate anisotropy term penalizes in-plane P, mimicking compressive
     substrate strain that favors out-of-plane Pz.
+
+    Bug fix #4: Clamp P values to prevent overflow in Px*Px² (cubic term).
+    Physical P should stay near ±Ps; values beyond 5*Ps indicate numerical
+    instability. Clamping prevents float64 overflow RuntimeWarnings.
     """
+    if xp is None:
+        xp = np
+
+    # Clamp to prevent overflow (physical P should stay near ±Ps)
+    Ps = abs(mat.alpha1 / (2 * mat.alpha11))**0.5 if mat.alpha11 > 0 else 1.0
+    P_max = 5.0 * Ps  # ~5*Ps safety margin
+    Px = xp.clip(Px, -P_max, P_max)
+    Py = xp.clip(Py, -P_max, P_max)
+    Pz = xp.clip(Pz, -P_max, P_max)
+
     Px2, Py2, Pz2 = Px**2, Py**2, Pz**2
     dPx = (2 * mat.alpha1 * Px
            + 4 * mat.alpha11 * Px * Px2
@@ -2090,7 +2104,7 @@ class FerroSolver:
         xp = self.xp
 
         # Nonlinear Landau derivative (real space)
-        dFx, dFy, dFz = landau_deriv_3c(self.Px, self.Py, self.Pz, self.mat)
+        dFx, dFy, dFz = landau_deriv_3c(self.Px, self.Py, self.Pz, self.mat, xp)
 
         # In-plane depol field from Poisson
         if self.use_elec:
@@ -2168,26 +2182,64 @@ class FerroSolver:
         self.history["f_total"].append(total)
 
     def _snapshot(self):
-        """Return all fields the visualizer might want (CPU arrays)."""
-        Px = to_cpu(self.Px)
-        Py = to_cpu(self.Py)
-        Pz = to_cpu(self.Pz)
-        P_mag = np.sqrt(Px**2 + Py**2 + Pz**2)
+        """Return all fields the visualizer might want (CPU arrays).
+
+        Bug fix #2: energy fields (f_bulk, f_grad, f_depol_Pz, f_depol_inplane,
+        f_total) are returned as 2D arrays, NOT scalars. The multi-field grid
+        visualizer calls ax.imshow() on each field, which requires a 2D array.
+        Previously these were stored as scalar mean values, causing
+        "TypeError: Invalid shape () for image data".
+        """
+        xp = self.xp
+        Px, Py, Pz = self.Px, self.Py, self.Pz
+        Px_cpu, Py_cpu, Pz_cpu = to_cpu(Px), to_cpu(Py), to_cpu(Pz)
+        P_mag = np.sqrt(Px_cpu**2 + Py_cpu**2 + Pz_cpu**2)
+
+        # ---- Recompute 2D energy density fields for visualization ----
+        Px2, Py2, Pz2 = Px**2, Py**2, Pz**2
+        mat = self.mat
+        f_bulk_2d = (mat.alpha1 * (Px2 + Py2 + Pz2)
+                     + mat.alpha11 * (Px2*Px2 + Py2*Py2 + Pz2*Pz2)
+                     + mat.alpha12 * (Px2*Py2 + Py2*Pz2 + Px2*Pz2)
+                     + 0.5 * mat.beta_sub * (Px2 + Py2))
+
+        Px_x, Px_y = xp.gradient(Px, self.dx, self.dy)
+        Py_x, Py_y = xp.gradient(Py, self.dx, self.dy)
+        Pz_x, Pz_y = xp.gradient(Pz, self.dx, self.dy)
+        f_grad_2d = (0.5 * mat.G11 * (Px_x**2 + Py_y**2)
+                     + mat.G12 * Px_x * Py_y
+                     + 0.5 * mat.G44 * ((Px_y + Py_x)**2 + Pz_x**2 + Pz_y**2))
+
+        # Depol Pz: broadcast scalar mean to 2D for visualization
+        Pz_hat = xp.fft.fft2(Pz)
+        f_depol_Pz_scalar = float(xp.mean(
+            (self.n_eff / (2 * EPSILON_0)) * xp.abs(Pz_hat)**2) / (self.Nx * self.Ny))
+        f_depol_Pz_2d = xp.full_like(Pz, f_depol_Pz_scalar)
+
+        if self.use_elec:
+            Ex_d, Ey_d = solve_poisson_inplane(
+                Px, Py, self.KX, self.KY, self.K2_safe, xp)
+            f_depol_in_2d = -0.5 * (Ex_d * Px + Ey_d * Py)
+        else:
+            f_depol_in_2d = xp.zeros_like(Px)
+
+        f_total_2d = f_bulk_2d + f_grad_2d + f_depol_Pz_2d + f_depol_in_2d
+
         return {
-            "Px": Px,
-            "Py": Py,
-            "Pz": Pz,
+            "Px": Px_cpu,
+            "Py": Py_cpu,
+            "Pz": Pz_cpu,
             "P_mag": P_mag,
-            "f_bulk": self.history["f_bulk"][-1],
-            "f_grad": self.history["f_grad"][-1],
-            "f_depol_Pz": self.history["f_depol_Pz"][-1],
-            "f_depol_inplane": self.history["f_depol_inplane"][-1],
-            "f_total": self.history["f_total"][-1],
+            "f_bulk": to_cpu(f_bulk_2d),
+            "f_grad": to_cpu(f_grad_2d),
+            "f_depol_Pz": to_cpu(f_depol_Pz_2d),
+            "f_depol_inplane": to_cpu(f_depol_in_2d),
+            "f_total": to_cpu(f_total_2d),
             "convergence": {
-                "f_total": self.history["f_total"][-1],
-                "mean_Pz": float(np.mean(np.abs(Pz))),
-                "mean_Pinplane": float(np.mean(np.sqrt(Px**2 + Py**2))),
-                "max_Pz": float(np.max(np.abs(Pz))),
+                "f_total": float(xp.mean(f_total_2d)),
+                "mean_Pz": float(np.mean(np.abs(Pz_cpu))),
+                "mean_Pinplane": float(np.mean(np.sqrt(Px_cpu**2 + Py_cpu**2))),
+                "max_Pz": float(np.max(np.abs(Pz_cpu))),
             },
         }
 
@@ -3228,6 +3280,7 @@ def build_sidebar():
     Ps = mat.Ps_eq()
     xi = mat.xi_wall()
     dx = L_box / Nx
+    nonlinear_cfl = dt * Gamma * abs(alpha1)
     st.sidebar.markdown(f"""
     **Derived quantities:**
     - |Ps| = {Ps*100:.2f} μC/cm²
@@ -3235,7 +3288,16 @@ def build_sidebar():
     - Grid dx = {dx*1e9:.3f} nm
     - ξ/dx = {xi/dx:.2f} (need > 3 for wall resolution)
     - Box/ξ = {L_box/xi:.1f} (need > 10 for multiple domains)
+    - dt·Γ·|α₁| = {nonlinear_cfl:.3e} (need < 1 for stability)
     """)
+
+    # Bug fix #4: Stability warning for nonlinear CFL
+    if nonlinear_cfl > 1.0:
+        st.sidebar.error(f"⚠️ UNSTABLE: dt·Γ·|α₁| = {nonlinear_cfl:.2e} > 1. "
+                         f"Reduce dt or Γ.")
+    elif nonlinear_cfl > 0.5:
+        st.sidebar.warning(f"⚠️ Marginal stability: dt·Γ·|α₁| = {nonlinear_cfl:.2e}. "
+                           f"Consider reducing dt.")
 
     params = {
         "mode": mode,
@@ -3634,7 +3696,7 @@ def render_results_tab(params, viz_cfg):
             show_font_sizes=True, show_colorbar=True, show_grid=True,
             show_axis_limits=True, show_text_overrides=True)
         fig = vis.create_multi_field_comparison(history[idx], style)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.pyplot(fig)
             plt.close(fig)
 
@@ -3648,7 +3710,7 @@ def render_results_tab(params, viz_cfg):
                                   overlay_field=ov["overlay"], alpha=ov["alpha"],
                                   mode=ov["mode"], n_contours=ov["n_contours"],
                                   style_params=style)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.pyplot(fig)
             plt.close(fig)
         else:
@@ -3663,7 +3725,7 @@ def render_results_tab(params, viz_cfg):
         fig = vis.create_vector_overlay(history[idx], density=vv["density"],
                                          color=vv["color"], scale=vv["scale"],
                                          base_field="Pz", style_params=style)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.pyplot(fig)
             plt.close(fig)
         else:
@@ -3837,7 +3899,7 @@ def render_line_profiles_tab(params, viz_cfg):
             fig = vis.create_multi_time_profiles(history, field_mt, ptype_mt, frames_sel,
                                                   position_ratio=pos_mt, use_plotly=use_plotly,
                                                   viz_cfg=viz_cfg)
-            if fig is not None:
+            if fig is not None and fig is not FAILED:
                 if use_plotly:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
@@ -3893,7 +3955,7 @@ def render_plotly_tab(params, viz_cfg):
         field = st.selectbox("Field", list(FIELD_DEFAULT_CMAPS.keys()), index=2, key="px_field")
         cmap = viz_cfg["field_settings"].get(field, {}).get("cmap", "viridis")
         fig = vis.create_plotly_heatmap(history[idx], field, idx, cmap, viz_cfg=viz_cfg)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.plotly_chart(fig, use_container_width=True)
 
     elif view == "3D surface":
@@ -3903,7 +3965,7 @@ def render_plotly_tab(params, viz_cfg):
         cmap = viz_cfg["field_settings"].get(field, {}).get("cmap", "viridis")
         fig = vis.create_plotly_3d_surface(history[idx], field, idx, cmap,
                                             show_contours=show_c, viz_cfg=viz_cfg)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.plotly_chart(fig, use_container_width=True)
 
     elif view == "Time-scrubbing animation":
@@ -3911,7 +3973,7 @@ def render_plotly_tab(params, viz_cfg):
         cmap = viz_cfg["field_settings"].get(field, {}).get("cmap", "viridis")
         with st.spinner("Building animation frames..."):
             fig = vis.create_plotly_animation(history, field, params["dt"], cmap, viz_cfg=viz_cfg)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning("Could not build animation.")
@@ -3925,7 +3987,7 @@ def render_plotly_tab(params, viz_cfg):
         pos = st.slider("Position ratio", 0.0, 1.0, 0.5, 0.05, key="px_lp_pos")
         if ptypes:
             fig = vis.create_plotly_line_profiles(history[idx], field, ptypes, pos, viz_cfg=viz_cfg)
-            if fig is not None:
+            if fig is not None and fig is not FAILED:
                 st.plotly_chart(fig, use_container_width=True)
 
 
@@ -4057,7 +4119,7 @@ def render_export_tab(params, viz_cfg):
             "figure_customization": viz_cfg.get("figure_customization", {}),
         }
         fig = vis_snap.create_multi_field_comparison(history[snap_frame], style)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             buf = BytesIO()
             fig.savefig(buf, format="png", dpi=int(viz_cfg.get("dpi", 150)),
                         bbox_inches="tight")
@@ -4206,7 +4268,7 @@ def render_single_view(sid, viz_cfg):
             "figure_customization": viz_cfg.get("figure_customization", {}),
         }
         fig = vis.create_multi_field_comparison(history[idx], style)
-        if fig is not None:
+        if fig is not None and fig is not FAILED:
             st.pyplot(fig)
             plt.close(fig)
 
@@ -4830,8 +4892,9 @@ def render_domain_analysis(solver, params, viz_cfg):
 
     # Domain analysis figure
     fig = create_domain_analysis_figure(Pz, Ps, dx, viz_cfg)
-    st.pyplot(fig)
-    plt.close(fig)
+    if fig is not None and fig is not FAILED:
+        st.pyplot(fig)
+        plt.close(fig)
 
     # Energy breakdown
     st.markdown("---")
@@ -4856,8 +4919,9 @@ def render_domain_analysis(solver, params, viz_cfg):
 
     # Energy breakdown figure
     fig_energy = create_energy_breakdown_figure(solver, viz_cfg)
-    st.pyplot(fig_energy)
-    plt.close(fig_energy)
+    if fig_energy is not None and fig_energy is not FAILED:
+        st.pyplot(fig_energy)
+        plt.close(fig_energy)
 
 
 # ============================================================================
@@ -5099,14 +5163,16 @@ def render_extended_diagnostics(solver, params, viz_cfg):
     # Polarization histograms
     st.markdown("#### Polarization component distributions")
     fig_hist = create_polarization_histogram_figure(Px, Py, Pz, Ps, viz_cfg)
-    st.pyplot(fig_hist)
-    plt.close(fig_hist)
+    if fig_hist is not None and fig_hist is not FAILED:
+        st.pyplot(fig_hist)
+        plt.close(fig_hist)
 
     # Pz power spectrum
     st.markdown("#### Pz Fourier spectrum (domain size analysis)")
     fig_spec = create_spectrum_figure(Pz, dx, viz_cfg)
-    st.pyplot(fig_spec)
-    plt.close(fig_spec)
+    if fig_spec is not None and fig_spec is not FAILED:
+        st.pyplot(fig_spec)
+        plt.close(fig_spec)
 
     # Domain analysis
     render_domain_analysis(solver, params, viz_cfg)
@@ -5352,8 +5418,9 @@ def render_domain_wall_analysis(Pz, Ps, dx, viz_cfg):
     """Render domain wall profile analysis."""
     st.markdown("#### Domain wall profile")
     fig = create_domain_wall_profile_figure(Pz, Ps, dx, viz_cfg)
-    st.pyplot(fig)
-    plt.close(fig)
+    if fig is not None and fig is not FAILED:
+        st.pyplot(fig)
+        plt.close(fig)
 
     # Compute wall width from profile
     pos, profile = extract_domain_wall_profile(Pz, Ps, dx)
@@ -5517,8 +5584,9 @@ def render_full_diagnostics_panel(solver, params, viz_cfg):
         # Domain analysis figure
         st.markdown("#### Domain structure visualization")
         fig = create_domain_analysis_figure(Pz, Ps, dx, viz_cfg)
-        st.pyplot(fig)
-        plt.close(fig)
+        if fig is not None and fig is not FAILED:
+            st.pyplot(fig)
+            plt.close(fig)
 
         # Domain wall profile
         st.markdown("#### Domain wall profile (averaged)")
@@ -5528,8 +5596,9 @@ def render_full_diagnostics_panel(solver, params, viz_cfg):
     st.markdown("---")
     st.subheader("📈 Energy breakdown")
     fig_energy = create_energy_breakdown_figure(solver, viz_cfg)
-    st.pyplot(fig_energy)
-    plt.close(fig_energy)
+    if fig_energy is not None and fig_energy is not FAILED:
+        st.pyplot(fig_energy)
+        plt.close(fig_energy)
 
     # ---- Section 5: Polarization histograms ----
     st.markdown("---")
@@ -5539,8 +5608,9 @@ def render_full_diagnostics_panel(solver, params, viz_cfg):
         fig_hist = create_polarization_histogram_figure(
             final["Px"], final["Py"], final["Pz"],
             params["mat"].Ps_eq(), viz_cfg)
-        st.pyplot(fig_hist)
-        plt.close(fig_hist)
+        if fig_hist is not None and fig_hist is not FAILED:
+            st.pyplot(fig_hist)
+            plt.close(fig_hist)
 
     # ---- Section 6: Fourier spectrum ----
     st.markdown("---")
@@ -5548,8 +5618,9 @@ def render_full_diagnostics_panel(solver, params, viz_cfg):
     if history:
         fig_spec = create_spectrum_figure(history[-1]["Pz"],
                                            params["L"] / params["Nx"], viz_cfg)
-        st.pyplot(fig_spec)
-        plt.close(fig_spec)
+        if fig_spec is not None and fig_spec is not FAILED:
+            st.pyplot(fig_spec)
+            plt.close(fig_spec)
 
     # ---- Section 7: Configuration summary ----
     st.markdown("---")
