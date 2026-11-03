@@ -3421,7 +3421,7 @@ def render_run_tab(params, viz_cfg):
         """)
 
     if st.button("▶️ Start Evolution", type="primary",
-                 use_container_width=True):
+                 width="stretch"):
         with st.spinner("Running FFT phase-field simulation..."):
             solver = FerroSolver(params)
             history = []
@@ -3910,7 +3910,7 @@ def render_line_profiles_tab(params, viz_cfg):
                                                   viz_cfg=viz_cfg)
             if fig is not None and fig is not FAILED:
                 if use_plotly:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 else:
                     st.pyplot(fig)
                     plt.close(fig)
@@ -3965,7 +3965,7 @@ def render_plotly_tab(params, viz_cfg):
         cmap = viz_cfg["field_settings"].get(field, {}).get("cmap", "viridis")
         fig = vis.create_plotly_heatmap(history[idx], field, idx, cmap, viz_cfg=viz_cfg)
         if fig is not None and fig is not FAILED:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     elif view == "3D surface":
         idx = st.slider("Frame", 0, len(history) - 1, len(history) - 1, key="px_3d_frame")
@@ -3975,7 +3975,7 @@ def render_plotly_tab(params, viz_cfg):
         fig = vis.create_plotly_3d_surface(history[idx], field, idx, cmap,
                                             show_contours=show_c, viz_cfg=viz_cfg)
         if fig is not None and fig is not FAILED:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     elif view == "Time-scrubbing animation":
         field = st.selectbox("Field", list(FIELD_DEFAULT_CMAPS.keys()), index=2, key="px_anim_field")
@@ -3983,7 +3983,7 @@ def render_plotly_tab(params, viz_cfg):
         with st.spinner("Building animation frames..."):
             fig = vis.create_plotly_animation(history, field, params["dt"], cmap, viz_cfg=viz_cfg)
         if fig is not None and fig is not FAILED:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("Could not build animation.")
 
@@ -3997,7 +3997,7 @@ def render_plotly_tab(params, viz_cfg):
         if ptypes:
             fig = vis.create_plotly_line_profiles(history[idx], field, ptypes, pos, viz_cfg=viz_cfg)
             if fig is not None and fig is not FAILED:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
 
 # ============================================================================
@@ -4142,7 +4142,12 @@ def render_export_tab(params, viz_cfg):
 # UI TAB: COMPARE
 # ============================================================================
 def render_compare_tab(params, viz_cfg):
-    """Side-by-side comparison of saved simulations."""
+    """Side-by-side comparison of saved simulations.
+
+    Fix: SimulationDatabase.list_for_ui() only returns lightweight summaries
+    (id, name, params) — NOT results_history. Must fetch full records via
+    SimulationDatabase.get(id) to access the saved field history.
+    """
     st.header("🔍 Compare Saved Simulations")
 
     sims = SimulationDatabase.list_for_ui()
@@ -4162,17 +4167,30 @@ def render_compare_tab(params, viz_cfg):
     cmap = ColormapRegistry.resolve(fs.get("cmap", "viridis"),
                                      invert=fs.get("invert", False))
 
-    # Global bounds across all selected sims
+    # ---- Fetch FULL simulation records (list_for_ui only has summaries) ----
     all_vals = []
+    selected_sims = []
+
     for n in picked:
-        s = sims[names.index(n)]
-        h = s["results_history"]
+        s_ui = sims[names.index(n)]
+        # FIX: Fetch the full simulation record using the ID
+        s_full = SimulationDatabase.get(s_ui["id"])
+        if s_full is None:
+            continue
+        selected_sims.append(s_full)
+
+        h = s_full.get("results_history", [])
         if h and field in h[-1]:
             d = np.asarray(h[-1][field])
             finite = d[np.isfinite(d)]
             if finite.size:
                 all_vals.append(finite)
 
+    if not selected_sims:
+        st.warning("No valid simulations could be loaded.")
+        return
+
+    # ---- Compute global bounds across all selected sims ----
     if fs.get("auto", True):
         if field in FIELD_DEFAULT_RNG:
             vmin_g, vmax_g = FIELD_DEFAULT_RNG[field]
@@ -4186,7 +4204,7 @@ def render_compare_tab(params, viz_cfg):
         vmin_g = fs.get("vmin")
         vmax_g = fs.get("vmax")
 
-    selected_sims = [sims[names.index(n)] for n in picked]
+    # ---- Render side-by-side heatmaps ----
     cols = min(3, len(selected_sims))
     rows = (len(selected_sims) + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
@@ -4194,7 +4212,7 @@ def render_compare_tab(params, viz_cfg):
 
     for i, sim in enumerate(selected_sims):
         p = sim["params"]
-        h = sim["results_history"]
+        h = sim.get("results_history", [])
         if not h or field not in h[-1]:
             continue
         d = np.asarray(h[-1][field])
@@ -4207,13 +4225,15 @@ def render_compare_tab(params, viz_cfg):
         ax.set_title(f"{sim['id']}\n{p.get('preset', '?')}, s={p.get('screening', 0):.2f}",
                      fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.046)
+
     for k in range(len(selected_sims), len(axes)):
         axes[k].axis("off")
+
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
 
-    # Show parameter comparison table
+    # ---- Parameter comparison table ----
     st.subheader("📋 Parameter comparison")
     rows_data = []
     for sim in selected_sims:
@@ -4226,11 +4246,10 @@ def render_compare_tab(params, viz_cfg):
             "h (nm)": f"{p.get('h_film_nm', 0):.1f}",
             "screening": f"{p.get('screening', 0):.2f}",
             "beta_sub": f"{p.get('beta_sub', 0):.2e}",
-            "α₁": f"{p.get('mat_alpha1', 0):.2e}" if "mat_alpha1" in p else "?",
         })
     st.dataframe(pd.DataFrame(rows_data))
 
-    # Database management
+    # ---- Database management ----
     st.markdown("---")
     with st.expander("🗄️ Simulation database", expanded=False):
         n_sims = len(SimulationDatabase.all())
