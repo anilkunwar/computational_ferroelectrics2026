@@ -5708,7 +5708,6 @@ def render_quick_start_guide():
         """)
 
 
-<<<<<<< HEAD
     # CSV export
     import pandas as pd
     df = pd.DataFrame(energy_log, columns=["step", "f_bulk", "f_grad",
