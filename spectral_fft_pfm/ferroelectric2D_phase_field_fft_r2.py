@@ -3301,9 +3301,10 @@ def build_sidebar():
         }[x])
     # Auto-configure noise amplitude based on morphology mode
     Ps_temp = float(np.sqrt(-alpha1 / (2*alpha11))) if alpha1 < 0 and alpha11 > 0 else 0.5
-    auto_noise_uc = auto_noise_factor * Ps_temp * 1e4  # C/m² → μC/cm²
+    auto_noise_uc = auto_noise_factor * Ps_temp * 100  # C/m² → μC/cm² (1 C/m² = 100 μC/cm²)
+    auto_noise_uc = max(1.0, min(float(auto_noise_uc), 100.0))  # clamp to widget bounds
     noise_amp_uc = st.sidebar.number_input("Noise amplitude (μC/cm²)", 1.0, 100.0,
-                                            float(auto_noise_uc), 1.0)
+                                            auto_noise_uc, 1.0)
     noise_amp = noise_amp_uc * 1e-2  # Bug fix #1: correct conversion
     noise_cutoff = st.sidebar.slider("Band cutoff (frac of Nyquist)", 0.05, 0.5, 0.15, 0.01)
     seed = st.sidebar.number_input("Random seed", 0, 1000, 42)
