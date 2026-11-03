@@ -139,7 +139,7 @@ GPU_AVAILABLE = False
 try:
     import cupy as cp
     cp.cuda.Device(0).use()
-    cp.zeros(1)                     # Force context initialization
+    cp.zeros(1)                    # Force context initialization
     GPU_AVAILABLE = True
     xp = cp
     logger.info("GPU (CuPy) detected and ready.")
@@ -149,132 +149,6 @@ except Exception as _gpu_err:
     logger.info(f"GPU not available: {_gpu_err}. Using CPU (NumPy).")
 
 
-# ------------------- PAGE -------------------
-st.set_page_config(page_title="Ferroelectric FFT Phase-Field (Thin Film)", layout="wide")
-st.title("Ferroelectric Phase-Field — FFT, 3-Component P, Thin-Film Depolarization")
-
-st.markdown("""
-**Methodology**: TDLGD + Landau-Devonshire bulk + Lifshitz gradient +
-in-plane depolarization (2D projector) + **out-of-plane depolarization via thin-film kernel**.
-
-All quantities in SI units. P_z is now an active order parameter with open-circuit
-boundary conditions (top/bottom surfaces unscreened by default).
-""")
-
-plt.style.use("seaborn-v0_8-paper")
-plt.rcParams.update({
-    "font.size": 12, "axes.titlesize": 14, "axes.labelsize": 13,
-    "legend.fontsize": 11, "xtick.labelsize": 11, "ytick.labelsize": 11,
-    "figure.dpi": 140, "axes.linewidth": 1.0, "lines.linewidth": 2.0,
-})
-
-# ------------------- SIDEBAR: GEOMETRY (SI) -------------------
-st.sidebar.header("Geometry (SI units)")
-max_res = 1024 if GPU_AVAILABLE else 512
-Nx = st.sidebar.slider("Nx", 64, max_res, 256, 32)
-Ny = st.sidebar.slider("Ny", 64, max_res, 256, 32)
-L_box_nm = st.sidebar.number_input("Box size L (nm)", 10.0, 500.0, 64.0, 2.0)
-L_box = L_box_nm * 1e-9  # m
-
-st.sidebar.header("Thin-film thickness (open-circuit direction)")
-h_film_nm = st.sidebar.number_input("Film thickness h (nm)", 1.0, 50.0, 8.0, 0.5)
-h_film = h_film_nm * 1e-9  # m
-
-# ------------------- TIME STEPPING (SI) -------------------
-st.sidebar.header("Time stepping (SI)")
-dt_ps = st.sidebar.number_input("dt (ps)", 0.001, 100.0, 1.0, 0.01)
-dt = dt_ps * 1e-12  # s
-n_steps = st.sidebar.slider("Steps", 50, 50000, 5000, 50)
-save_every = st.sidebar.slider("Save every", 1, 500, max(1, 5000 // 30), 1)
-
-# ------------------- LANDAU-DEVONSHIRE (SI) -------------------
-st.sidebar.header("Landau-Devonshire (SI: V·m/C, V·m⁵/C³)")
-preset = st.sidebar.selectbox("Material preset", ["PbTiO3-like", "HfO2-like", "Custom"], index=0)
-if preset == "PbTiO3-like":
-    alpha1_def, alpha11_def, alpha12_def = -3.0e10, 6.0e10, 1.5e11
-    G11_def, G44_def = 1.0e-8, 1.0e-8
-elif preset == "HfO2-like":
-    alpha1_def, alpha11_def, alpha12_def = -2.5e9, 6.0e10, 1.5e11
-    G11_def, G44_def = 1.0e-10, 1.0e-10
-else:
-    alpha1_def, alpha11_def, alpha12_def = -3.0e10, 6.0e10, 1.5e11
-    G11_def, G44_def = 1.0e-8, 1.0e-8
-
-alpha1  = st.sidebar.number_input("α₁ (V·m/C, <0 below Tc)", -5e11, 0.0, float(alpha1_def), 1e9, format="%.3e")
-alpha11 = st.sidebar.number_input("α₁₁ (V·m⁵/C³)", 1e8, 1e12, float(alpha11_def), 1e9, format="%.3e")
-st.sidebar.markdown("*For tetragonal symmetry: α₁₂ > 2α₁₁*")
-alpha12 = st.sidebar.number_input("α₁₂ (V·m⁵/C³)", 0.0, 5e11, float(alpha12_def), 1e9, format="%.3e")
-
-# ------------------- GRADIENT (SI) -------------------
-st.sidebar.header("Lifshitz gradient (V·m³/C)")
-G11 = st.sidebar.number_input("G₁₁", 1e-11, 1e-6, float(G11_def), 1e-10, format="%.3e")
-G12 = 0.0
-G44 = st.sidebar.number_input("G₄₄", 1e-11, 1e-6, float(G44_def), 1e-10, format="%.3e")
-
-# ------------------- SUBSTRATE ANISOTROPY (mimics compressive strain) -------------------
-st.sidebar.header("Substrate anisotropy (favors Pz)")
-st.sidebar.markdown("""
-Adds quadratic penalty β_sub*(Px²+Py²)/2 on in-plane P.
-With β_sub > |α₁|, in-plane P is suppressed and only Pz can be ferroelectric.
-This mimics compressive substrate strain (which favors out-of-plane Pz)
-without requiring full elastic + electrostrictive coupling.
-""")
-use_substrate = st.sidebar.checkbox("Enable substrate anisotropy", True)
-if use_substrate:
-    beta_sub = st.sidebar.number_input(
-        "β_sub (V·m/C, need > |α₁| = {:.2e})".format(abs(alpha1)),
-        0.0, 1e12, float(abs(alpha1) * 1.5), 1e9, format="%.3e"
-    )
-else:
-    beta_sub = 0.0
-
-# ------------------- KINETICS -------------------
-st.sidebar.header("Kinetics")
-Gamma = st.sidebar.number_input("Γ (Ω·m)⁻¹", 0.001, 100.0, 1.0, 0.1)
-
-# ------------------- ELECTROSTATICS -------------------
-st.sidebar.header("Depolarization (open-circuit kernel)")
-use_elec = st.sidebar.checkbox("Enable depolarization fields", True)
-st.sidebar.markdown("**Screening factor** (0 = perfect electrodes / short-circuit, "
-                    "1 = open-circuit / no electrodes):")
-screening_factor = st.sidebar.slider("Screening factor s ∈ [0,1]", 0.0, 1.0, 0.65, 0.01)
-st.sidebar.markdown("*With s≈0.6–0.7, uniform Pz is penalized but stripe Pz patterns "
-                    "are favored → 180° stripe domains form.*")
-
-use_ext_E = st.sidebar.checkbox("Apply external E field", False)
-if use_ext_E:
-    Ex_ext = st.sidebar.number_input("E_ext,x (MV/m)", -500.0, 500.0, 50.0, 1.0) * 1e6
-    Ey_ext = st.sidebar.number_input("E_ext,y (MV/m)", -500.0, 500.0, 0.0, 1.0) * 1e6
-    Ez_ext = st.sidebar.number_input("E_ext,z (MV/m)", -500.0, 500.0, 0.0, 1.0) * 1e6
-else:
-    Ex_ext = Ey_ext = Ez_ext = 0.0
-
-# ------------------- INITIAL CONDITION -------------------
-st.sidebar.header("Initial condition")
-init_mode = st.sidebar.selectbox(
-    "Init type",
-    ["Band-limited noise on Pz", "Pure white noise (all 3 components)", "Seeded Pz stripes"],
-    index=0
-)
-noise_amp_uc = st.sidebar.number_input("Noise amplitude (μC/cm²)", 1.0, 100.0, 20.0, 1.0)
-noise_amp = noise_amp_uc * 1e4 * 1e-4  # μC/cm² -> C/m² (1 μC/cm² = 1e-2 C/m²)
-noise_cutoff = st.sidebar.slider("Band cutoff (frac of Nyquist)", 0.05, 0.5, 0.15, 0.01)
-seed = st.sidebar.number_input("Random seed", 0, 1000, 42)
-
-# ------------------- VECTOR DISPLAY -------------------
-st.sidebar.header("Vector display")
-show_arrows = st.sidebar.checkbox("Overlay in-plane P arrows", True)
-arrow_skip = st.sidebar.slider("Arrow subsample stride", 4, 40, 12, 2)
-
-run_button = st.sidebar.button("Run simulation")
-
-# ------------------- DERIVED QUANTITIES -------------------
-Ps_eq = float(np.sqrt(-alpha1 / (2*alpha11))) if alpha1 < 0 and alpha11 > 0 else 1.0
-xi_wall = float(np.sqrt(G11 / abs(alpha1))) if alpha1 != 0 else 1.0
-st.sidebar.markdown(f"**Derived**: |Ps| = {Ps_eq*100:.2f} μC/cm², "
-                    f"wall width ξ = {xi_wall*1e9:.3f} nm")
-
-# ------------------- HELPERS -------------------
 def to_cpu(arr):
     """Move any array-like to a NumPy array in host memory."""
     if GPU_AVAILABLE and hasattr(arr, "get"):
@@ -1818,7 +1692,7 @@ PRESETS = {
         alpha1=-3.0e10, alpha11=6.0e10, alpha12=1.5e11,
         G11=1.0e-8, G44=1.0e-8, beta_sub=4.5e10,  # 1.5 * |alpha1|
     ),
-    "HfO2-like ": LandauParams(
+    "HfO2-like": LandauParams(
         alpha1=-2.5e9, alpha11=6.0e10, alpha12=1.5e11,
         G11=1.0e-10, G44=1.0e-10, beta_sub=3.75e9,  # 1.5 * |alpha1|
     ),
@@ -5474,7 +5348,7 @@ def get_parameter_sweep_grid():
     Useful for running multiple simulations to explore the parameter space.
     """
     presets = []
-    for material in ["PbTiO3-like", "HfO2-like "]:
+    for material in ["PbTiO3-like", "HfO2-like"]:
         for screening in [0.3, 0.5, 0.65, 0.8, 1.0]:
             for h_nm in [4.0, 8.0, 16.0]:
                 for beta_factor in [0.0, 1.0, 1.5, 2.0]:
@@ -5708,51 +5582,6 @@ def render_quick_start_guide():
         """)
 
 
-    # CSV export
-    import pandas as pd
-    df = pd.DataFrame(energy_log, columns=["step", "f_bulk", "f_grad",
-                                            "f_depol_Pz", "f_depol_inplane", "f_total"])
-    st.dataframe(df.head(20).style.format("{:.4e}"))
-    csv = df.to_csv(index=False).encode()
-    st.download_button("Download energy CSV", csv, "ferro_energy.csv", "text/csv")
-
-else:
-    st.info("Configure parameters in the sidebar and click **Run simulation**.")
-
-# ------------------- NOTES -------------------
-st.markdown("""
----
-**Key physics**
-
-* **3-component P = (Px, Py, Pz)** with Pz as out-of-plane. This is the
-  correct geometry for a thin film (film in xy-plane, Pz normal to film).
-
-* **Thin-film depolarization kernel** for Pz:
-    n(k) = tanh(k·h/2) / (k·h/2)
-  with n(0)=1 (full depol for uniform Pz) and n(∞)→0 (no depol for fine stripes).
-  This is the open-circuit boundary condition in z, captured exactly in Fourier space.
-
-* **Screening factor** s ∈ [0,1]:
-    n_eff(k) = s * n(k)
-  s=1: open-circuit (no electrodes, full depol).
-  s=0: short-circuit (perfect electrodes, no depol).
-  Intermediate s ≈ 0.6–0.7 typically gives 180° stripe domain formation
-  (uniform Pz penalized, stripes less penalized).
-
-* **In-plane (Px, Py) depolarization** uses the 2D projector k⊗k/k²
-  (volume bound charges from ∇·P_inplane).
-
-* **Landau parameters**: for proper tetragonal symmetry, α₁₂ > 2α₁₁.
-  Material presets: PbTiO3-like (|Ps|≈50 μC/cm², ξ≈0.6 nm) or
-  HfO2-like (|Ps|≈14 μC/cm², ξ≈0.2 nm).
-
-* **Why semi-implicit?** Linear part (gradient + depol) treated implicitly
-  → unconditionally stable. Nonlinear Landau part treated explicitly.
-  Time step set by `dt * Γ * |α₁| < 1`.
-
-**Units**: all SI. P in C/m², E in V/m, length in m, time in s, energy in J/m³.
-""")
-=======
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
@@ -5771,4 +5600,3 @@ if __name__ == "__main__":
     print(f"=" * 60)
     print(f"Starting Streamlit app...")
     main()
-
