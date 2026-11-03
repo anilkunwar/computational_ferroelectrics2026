@@ -5772,4 +5772,4 @@ if __name__ == "__main__":
     print(f"=" * 60)
     print(f"Starting Streamlit app...")
     main()
->>>>>>> b711700... Update ferroelectric2D_phase_field_fft_r1.py
+
