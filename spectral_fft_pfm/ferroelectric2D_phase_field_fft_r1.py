@@ -3797,9 +3797,18 @@ def render_results_tab(params, viz_cfg):
         ax = axes[1, 1]
         mean_Pz = [h["convergence"]["mean_Pz"] for h in history]
         mean_Pin = [h["convergence"]["mean_Pinplane"] for h in history]
-        ax.plot(steps, mean_Pz, color=col1,
+
+        # Fix #1: Generate saved_steps array matching the length of history
+        # (history only contains saved frames, not every step)
+        save_every = params.get("save_every", 1)
+        n_steps_total = params.get("n_steps", 5000)
+        saved_steps = [i * save_every for i in range(len(history))]
+        if len(saved_steps) > 1:
+            saved_steps[-1] = n_steps_total - 1  # last frame = final step
+
+        ax.plot(saved_steps, mean_Pz, color=col1,
                 linestyle=ls_main, lw=lw_main, label="|Pz| mean")
-        ax.plot(steps, mean_Pin, color=col2,
+        ax.plot(saved_steps, mean_Pin, color=col2,
                 linestyle=ls_minor, lw=lw_minor, label="|P_inplane| mean")
         apply_axis_styling(ax, fig_cfg,
                            title="Polarization magnitude evolution",
