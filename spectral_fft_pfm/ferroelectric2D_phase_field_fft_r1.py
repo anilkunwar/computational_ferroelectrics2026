@@ -1820,7 +1820,7 @@ PRESETS = {
         alpha1=-3.0e10, alpha11=6.0e10, alpha12=1.5e11,
         G11=1.0e-8, G44=1.0e-8, beta_sub=4.5e10,  # 1.5 * |alpha1|
     ),
-    "HfO2-like (Kumar)": LandauParams(
+    "HfO2-like ": LandauParams(
         alpha1=-2.5e9, alpha11=6.0e10, alpha12=1.5e11,
         G11=1.0e-10, G44=1.0e-10, beta_sub=3.75e9,  # 1.5 * |alpha1|
     ),
@@ -3293,7 +3293,6 @@ def render_geometry_tab(params, viz_cfg):
     """)
 
     # Show the initial Pz field
-    from physics_ic import make_initial_P
     Px0, Py0, Pz0 = make_initial_P(
         Nx, Ny, L, params["init_mode"],
         params["noise_amp"], params["noise_cutoff"],
@@ -3331,12 +3330,6 @@ def render_geometry_tab(params, viz_cfg):
         plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
-
-
-# Forward declaration so the function above can find it
-class physics_ic:
-    """Namespace wrapper for make_initial_P (defined above)."""
-    make_initial_P = staticmethod(make_initial_P)
 
 
 # ============================================================================
@@ -5388,7 +5381,7 @@ def get_parameter_sweep_grid():
     Useful for running multiple simulations to explore the parameter space.
     """
     presets = []
-    for material in ["PbTiO3-like", "HfO2-like (Kumar)"]:
+    for material in ["PbTiO3-like", "HfO2-like "]:
         for screening in [0.3, 0.5, 0.65, 0.8, 1.0]:
             for h_nm in [4.0, 8.0, 16.0]:
                 for beta_factor in [0.0, 1.0, 1.5, 2.0]:
@@ -5670,10 +5663,16 @@ st.markdown("""
 if __name__ == "__main__":
     # Print version info to console on startup
     info = get_version_info()
+    print(f"=" * 60)
     print(f"Ferroelectric Phase-Field Simulator v{info['version']}")
     print(f"Build date: {info['build_date']}")
     print(f"GPU backend: {info['gpu_backend']}")
+    print(f"Physics: {info['physics']}")
+    print(f"Discretization: {info['discretization']}")
+    print(f"Units: {info['units']}")
     print(f"Bug fixes applied: {', '.join(info['bug_fixes_applied'])}")
+    print(f"Features: {len(info['features'])} capabilities available")
+    print(f"=" * 60)
     print(f"Starting Streamlit app...")
     main()
 >>>>>>> b711700... Update ferroelectric2D_phase_field_fft_r1.py
