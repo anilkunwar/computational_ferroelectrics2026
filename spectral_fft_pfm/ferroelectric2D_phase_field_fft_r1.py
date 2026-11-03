@@ -275,8 +275,6 @@ st.sidebar.markdown(f"**Derived**: |Ps| = {Ps_eq*100:.2f} μC/cm², "
                     f"wall width ξ = {xi_wall*1e9:.3f} nm")
 
 # ------------------- HELPERS -------------------
-=======
->>>>>>> b711700... Update ferroelectric2D_phase_field_fft_r1.py
 def to_cpu(arr):
     """Move any array-like to a NumPy array in host memory."""
     if GPU_AVAILABLE and hasattr(arr, "get"):
